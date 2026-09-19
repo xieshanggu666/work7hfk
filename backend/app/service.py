@@ -18,13 +18,19 @@ from .forging import FORGE_COST, effective_card, branch_name
 
 # 规则版本：引擎/结算/存档结构发生语义变化时递增。
 # 建局写入 run 状态、每个动作事件携带 ver；回放据此标记录制版本与旧日志兼容。
-RULES_VERSION = "2.0.0"
+# 2.1.0：多章远征（章节 run 的 create 事件可携带交接快照 carry，回放据此重建初始状态）。
+RULES_VERSION = "2.1.0"
 
 # 初始牌组：卡牌 id 列表；建局时展开为独立实例（同名卡各持一份成长状态）
 START_DECK = ["strike", "strike", "strike", "strike", "guard", "guard", "guard"]
 INIT_LOCKED = ["heavy_blow", "cleave", "shield_bash", "pommel", "battle_trance",
                "flex", "iron_wave", "flurry", "adrenaline", "swift", "blood_echo",
                "reckless", "demon_form", "sword_dance"]
+
+# ---------- 多章远征 ----------
+DEFAULT_CHAPTERS = 3          # 默认章节数
+MAX_CHAPTERS = 9              # 单次远征章节上限
+CHAPTER_CLEAR_HEAL_RATIO = 0.25  # 章节交接休整：进入下一章时回复 max_health 的 25%
 
 
 class DuplicateReward(Exception):
@@ -50,21 +56,39 @@ def _make_instances(ids):
     return uids, instances
 
 
-def _new_run_state(seed):
-    deck_uids, instances = _make_instances(START_DECK)
+def _new_run_state(seed, carry=None):
+    """构造初始 run 状态。
+
+    carry 非 None（远征章节 run）时以交接快照为起点：牌组（含锻造成长）、遗物、
+    金币、生命/能量上限全部带入新章，并按 CHAPTER_CLEAR_HEAL_RATIO 休整回血。
+    同一 carry 必得同一初始状态——在线开章与回放重建共用本函数，天然一致。
+    """
+    if carry is None:
+        deck_uids, instances = _make_instances(START_DECK)
+        carry = {
+            "deck": deck_uids, "card_instances": instances,
+            "next_card_seq": len(deck_uids) + 1,
+            "relics": {}, "gold": 0,
+            "max_health": 75, "health": 75, "base_energy": 3,
+        }
+        heal = 0
+    else:
+        heal = max(1, int(carry.get("max_health", 75) * CHAPTER_CLEAR_HEAL_RATIO))
+    instances = copy.deepcopy(carry["card_instances"])
+    max_hp = carry.get("max_health", 75)
     return {
         "seed": seed,
         "rules_version": RULES_VERSION,
         "status": "in_progress",
         "position": "start",
-        "max_health": 75,
-        "health": 75,
-        "base_energy": 3,
-        "deck": deck_uids,             # 手牌引用（uid）
-        "card_instances": instances,  # uid -> {id, forges:[分支id]}
-        "next_card_seq": len(deck_uids) + 1,  # uid 单调发号器
-        "gold": 0,
-        "relics": {},
+        "max_health": max_hp,
+        "health": min(max_hp, max(1, carry.get("health", max_hp)) + heal),
+        "base_energy": carry.get("base_energy", 3),
+        "deck": list(carry["deck"]),      # 手牌引用（uid）
+        "card_instances": instances,      # uid -> {id, forges:[分支id]}
+        "next_card_seq": carry.get("next_card_seq", len(instances) + 1),  # uid 单调发号器
+        "gold": carry.get("gold", 0),
+        "relics": dict(carry.get("relics", {})),
         "in_battle": False,
         "battle_index": 0,
         "battle": None,
@@ -143,6 +167,230 @@ def create_run(seed=None):
 
 def load_run(run_id):
     return db.load_run(run_id)
+
+
+# ---------- 多章远征 ----------
+def _chapter_seed(exp_seed, chapter):
+    """远征种子 -> 第 N 章种子（确定性派生；各章地图/洗牌独立但可复现）。"""
+    return (exp_seed * 131 + (chapter - 1) * 7919) & 0x7FFFFFFF
+
+
+def _carry_from_run(run):
+    """章节通关后的「奖励交接」快照：牌组（含锻造成长）、遗物、金币、生命与能量上限。"""
+    instances = run.get("card_instances", {})
+    return {
+        "deck": list(run["deck"]),
+        "card_instances": copy.deepcopy(instances),
+        "next_card_seq": run.get("next_card_seq", len(instances) + 1),
+        "relics": dict(run["relics"]),
+        "gold": run["gold"],
+        "max_health": run["max_health"],
+        "health": run["health"],
+        "base_energy": run.get("base_energy", 3),
+    }
+
+
+def _exp_badge(exp):
+    """随 run 视口下发的远征摘要（章节进度/状态），供前端展示横幅。"""
+    return {
+        "id": exp["id"], "status": exp["status"],
+        "chapter": exp["chapter"], "chapters_total": exp["chapters_total"],
+    }
+
+
+def _carry_public(carry):
+    """交接快照的只读视口：牌组按实例呈现（携带各自锻造分支）。"""
+    instances = carry.get("card_instances", {})
+    return {
+        "deck": [{
+            "uid": uid, "id": instances[uid]["id"],
+            "forges": list(instances[uid].get("forges", [])),
+        } for uid in carry.get("deck", []) if uid in instances],
+        "gold": carry.get("gold", 0),
+        "relics": dict(carry.get("relics", {})),
+        "health": carry.get("health"),
+        "max_health": carry.get("max_health"),
+    }
+
+
+def _expedition_view(exp):
+    """远征全量视口：状态/章节进度/交接快照/各章存档索引。"""
+    return {
+        "id": exp["id"],
+        "seed": exp["seed"],
+        "status": exp["status"],
+        "chapter": exp["chapter"],
+        "chapters_total": exp["chapters_total"],
+        "current_run_id": exp["current_run_id"],
+        "carry": _carry_public(exp["carry"]) if exp.get("carry") else None,
+        "chapters": db.list_expedition_runs(exp["id"]),
+        "rev": exp["rev"],
+    }
+
+
+def create_expedition(seed=None, chapters=None):
+    """创建远征：远征记录与第 1 章 run 在同一事务落库，绝不留下「无章节」的远征。"""
+    seed = seed if seed is not None else random.randint(0, 2**31 - 1)
+    total = chapters if chapters is not None else DEFAULT_CHAPTERS
+    if not isinstance(total, int) or not (1 <= total <= MAX_CHAPTERS):
+        raise InvalidAction(f"chapters must be 1..{MAX_CHAPTERS}")
+    exp_id = uuid.uuid4().hex[:12]
+    run_id = uuid.uuid4().hex[:12]
+    state = _new_run_state(_chapter_seed(seed, 1))
+    map_data = mapgen.generate_map(state["seed"])
+    with db.transaction() as conn:
+        db.insert_expedition(conn, exp_id, seed, total, run_id)
+        db.insert_run(conn, run_id, state["seed"], state["status"], state["position"],
+                      map_data, state, expedition_id=exp_id, chapter=1)
+        db.append_event_conn(conn, run_id, 1, "create", {
+            "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
+            "expedition": exp_id, "chapter": 1,
+        })
+        db.append_expedition_event_conn(conn, exp_id, 1, "create", {
+            "seed": seed, "chapters": total, "chapter": 1, "run_id": run_id,
+        })
+    exp = db.load_expedition(exp_id)
+    return {
+        "expedition": _expedition_view(exp),
+        "run": _public_view(state, map_data, run_id, rev=1, expedition=_exp_badge(exp)),
+    }
+
+
+def get_expedition(exp_id):
+    """远征视口 + 当前章节 run 视口（续远征入口）。"""
+    exp = db.load_expedition(exp_id)
+    if exp is None:
+        raise InvalidAction("expedition not found")
+    return {"expedition": _expedition_view(exp), "run": resume(exp["current_run_id"])}
+
+
+def advance_expedition(exp_id, request_id=None):
+    """进入下一章：以当前章的交接快照开新章 run。
+
+    防重复开章：
+    - 仅当远征进行中且当前章 run 已通关（won）才允许推进；推进后 chapter 与
+      current_run_id 原子更新，重复调用看到的当前章不再是「已通关」状态 -> 400；
+    - request_id 幂等：同一令牌重复/并发提交返回首次响应（duplicate:true），
+      不会重复创建章节 run；
+    - 远征记录、新章 run、双方日志在同一事务提交，任何写入失败整体回滚。
+    """
+    with db.run_lock(f"exp:{exp_id}"):
+        with db.transaction() as conn:
+            prior = db.get_idempotent(conn, f"exp:{exp_id}", request_id)
+            if prior is not None:
+                cached = dict(prior["response"])
+                cached["duplicate"] = True
+                return cached
+
+            row = conn.execute("SELECT * FROM expeditions WHERE id=?", (exp_id,)).fetchone()
+            if row is None:
+                raise InvalidAction("expedition not found")
+            if row["status"] != "in_progress":
+                # 已结算（won/lost）：不重复结算、不再开章
+                raise DuplicateReward(f"expedition already settled ({row['status']})")
+            cur = conn.execute("SELECT * FROM runs WHERE id=?",
+                               (row["current_run_id"],)).fetchone()
+            if cur is None:
+                raise InvalidAction("current chapter run not found")
+            if cur["status"] != "won":
+                raise InvalidAction("current chapter not cleared yet")
+            chapter = row["chapter"]
+            if chapter >= row["chapters_total"]:
+                raise InvalidAction("expedition already at final chapter")
+
+            nxt = chapter + 1
+            carry = _carry_from_run(json.loads(cur["state_json"]))
+            run_id = uuid.uuid4().hex[:12]
+            state = _new_run_state(_chapter_seed(row["seed"], nxt), carry=carry)
+            map_data = mapgen.generate_map(state["seed"])
+            try:
+                db.insert_run(conn, run_id, state["seed"], state["status"], state["position"],
+                              map_data, state, expedition_id=exp_id, chapter=nxt)
+                db.append_event_conn(conn, run_id, 1, "create", {
+                    "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
+                    "expedition": exp_id, "chapter": nxt, "carry": carry,
+                })
+                seq = db.next_expedition_seq_conn(conn, exp_id)
+                db.append_expedition_event_conn(conn, exp_id, seq, "advance", {
+                    "chapter": nxt, "run_id": run_id, "carry": carry,
+                    "rest_heal": state["health"] - carry["health"],
+                })
+                db.save_expedition_conn(conn, exp_id, "in_progress", nxt, run_id, carry,
+                                        expected_rev=row["rev"])
+            except db.ConcurrentModification as e:
+                raise StaleState(str(e))
+
+            exp = db.load_expedition(exp_id)
+            response = {
+                "expedition": _expedition_view(exp),
+                "run": _public_view(state, map_data, run_id, rev=1, expedition=_exp_badge(exp)),
+                "duplicate": False,
+            }
+            db.put_idempotent(conn, f"exp:{exp_id}", request_id, seq, response)
+            return response
+
+
+def _sync_expedition_conn(conn, exp_id, run_rec, run):
+    """在线行动提交时同步远征状态（与存档/日志同一事务）。
+
+    章节 run 结束时：
+    - 战败 -> 远征结算为 lost（战败解锁由行动事务内的 profile 写入一并提交）；
+    - 击败终章首领 -> 远征结算为 won；
+    - 击败非终章首领 -> 记录 chapter_clear 事件与交接快照，等待 advance。
+    已结算或不是当前章节的重复触发直接跳过（不重复结算）。
+    返回随视口下发的远征摘要。
+    """
+    row = conn.execute("SELECT * FROM expeditions WHERE id=?", (exp_id,)).fetchone()
+    if row is None:
+        return None
+    if (row["status"] == "in_progress" and row["current_run_id"] == run_rec["id"]
+            and run["status"] in ("won", "lost")):
+        carry = _carry_from_run(run)
+        chapter = run_rec.get("chapter") or row["chapter"]
+        if run["status"] == "lost":
+            new_status, kind = "lost", "settle"
+            payload = {"result": "lost", "chapter": chapter, "run_id": run_rec["id"],
+                       "battles": run.get("battle_index", 0), "carry": carry}
+        elif chapter >= row["chapters_total"]:
+            new_status, kind = "won", "settle"
+            payload = {"result": "won", "chapter": chapter, "run_id": run_rec["id"],
+                       "chapters": row["chapters_total"], "carry": carry}
+        else:
+            new_status, kind = "in_progress", "chapter_clear"
+            payload = {"chapter": chapter, "run_id": run_rec["id"], "carry": carry}
+        seq = db.next_expedition_seq_conn(conn, exp_id)
+        db.append_expedition_event_conn(conn, exp_id, seq, kind, payload)
+        db.save_expedition_conn(conn, exp_id, new_status, row["chapter"],
+                                row["current_run_id"], carry, expected_rev=row["rev"])
+        return {"id": exp_id, "status": new_status,
+                "chapter": chapter, "chapters_total": row["chapters_total"]}
+    return {"id": exp_id, "status": row["status"],
+            "chapter": row["chapter"], "chapters_total": row["chapters_total"]}
+
+
+def expedition_replay(exp_id):
+    """整程回放：远征事件时间线 + 逐章完整回放（每章复用单局可交互回放）。
+
+    全程只读：不写 runs/battle_events/profile/expeditions，战败章节不发解锁。
+    """
+    exp = db.load_expedition(exp_id)
+    if exp is None:
+        raise InvalidAction("expedition not found")
+    chapters = []
+    for r in db.list_expedition_runs(exp_id):
+        rep = replay(r["run_id"])
+        chapters.append({
+            "chapter": r["chapter"],
+            "run_id": r["run_id"],
+            "status": r["status"],
+            "replay": rep,
+        })
+    return {
+        "expedition": _expedition_view(exp),
+        "events": db.load_expedition_events(exp_id),
+        "chapters": chapters,
+        "isolated": True,  # 声明：本次整程回放无任何存档写入与解锁副作用
+    }
 
 
 def _require_run(run_id):
@@ -230,6 +478,7 @@ def act(run_id, action):
                 "id": row["id"], "seed": row["seed"], "status": row["status"],
                 "position": row["position"], "map": json.loads(row["map_json"]),
                 "state": json.loads(row["state_json"]), "rev": row["rev"],
+                "expedition_id": row["expedition_id"], "chapter": row["chapter"],
             }
             if expected_rev is not None and expected_rev != rec["rev"]:
                 raise StaleState(f"state version conflict: expected {expected_rev}, actual {rec['rev']}")
@@ -266,8 +515,16 @@ def act(run_id, action):
             db.append_event_conn(conn, run_id, seq, a, payload)
             if pending_unlock is not None:
                 db.upsert_profile_conn(conn, pending_unlock)
+            # 远征章节 run：章节通关/战败在同一事务内同步远征状态（不重复结算）
+            exp_badge = None
+            if rec.get("expedition_id"):
+                try:
+                    exp_badge = _sync_expedition_conn(conn, rec["expedition_id"], rec, run)
+                except db.ConcurrentModification as e:
+                    raise StaleState(str(e))
 
-            response = {"seq": seq, "log": log, "run": _public_view(run, map_data, run_id),
+            response = {"seq": seq, "log": log,
+                        "run": _public_view(run, map_data, run_id, expedition=exp_badge),
                         "rev": rec["rev"] + 1, "duplicate": False}
             db.put_idempotent(conn, run_id, request_id, seq, response)
             return response
@@ -654,7 +911,13 @@ def resume(run_id):
                 rev = row["rev"] + 1
             else:
                 rev = row["rev"]
-            return _public_view(state, map_data, run_id, rev=rev)
+            # 远征章节 run：视口携带远征摘要（章节进度/结算状态）
+            exp_badge = None
+            if row["expedition_id"]:
+                exp = db.load_expedition(row["expedition_id"])
+                if exp is not None:
+                    exp_badge = _exp_badge(exp)
+            return _public_view(state, map_data, run_id, rev=rev, expedition=exp_badge)
 
 
 # ---------- 规则版本与校验点 ----------
@@ -698,9 +961,23 @@ def replay(run_id):
     # 只读已持久化日志：经共享连接读取，保证读到的都是已提交事务
     events = db.load_events(run_id)
 
-    # 回放起点：重新构造建局时的初始状态（不读、不写、不迁移真实存档）
-    sim = _new_run_state(seed)
+    # 回放起点：重新构造建局时的初始状态（不读、不写、不迁移真实存档）。
+    # 远征章节 run 的起点由 create 事件携带的交接快照（carry）重建，与在线开章一致。
+    create_payload = next(
+        (e.get("payload") for e in events
+         if e.get("action") == "create" and isinstance(e.get("payload"), dict)),
+        {},
+    )
+    carry = create_payload.get("carry") if not create_payload.get("_corrupt") else None
+    sim = _new_run_state(seed, carry=carry)
     initial_ckpt = state_checkpoint(sim)
+
+    # 远征章节 run：帧视口携带远征摘要（只读，不阻断回放）
+    exp_badge = None
+    if rec.get("expedition_id"):
+        exp = db.load_expedition(rec["expedition_id"])
+        if exp is not None:
+            exp_badge = _exp_badge(exp)
 
     steps = []
     checks = []          # 每步校验结果
@@ -770,7 +1047,8 @@ def replay(run_id):
             "summary": _step_summary(a, payload, log),
             "events": anim_events,
             "result": _step_result(log),
-            "view": _public_view(sim, map_data, run_id, include_unlocks=False),
+            "view": _public_view(sim, map_data, run_id, include_unlocks=False,
+                                 expedition=exp_badge),
             "check": status,
             "legacy": is_legacy or migrated_step,
             "migrated": migrated_step,
@@ -792,7 +1070,8 @@ def replay(run_id):
         "legacy": legacy_steps > 0 or not recorded_versions,
         "initial": {"checkpoint": initial_ckpt},
         "steps": steps,
-        "final_view": _public_view(sim, map_data, run_id, include_unlocks=False),
+        "final_view": _public_view(sim, map_data, run_id, include_unlocks=False,
+                                   expedition=exp_badge),
         "verification": {
             "ok": sum(c["status"] == "ok" for c in checks),
             "legacy": sum(c["status"] == "legacy" for c in checks),
@@ -927,10 +1206,11 @@ def _hand_public(run, bstate):
     return out
 
 
-def _public_view(run, map_data, run_id, include_unlocks=True, rev=None):
+def _public_view(run, map_data, run_id, include_unlocks=True, rev=None, expedition=None):
     """只读视口。include_unlocks=False（回放）时不读取 profile 库，省略解锁信息。
 
     rev 非 None 时附带存档乐观版本号，客户端下次行动可作为 expected_rev 回传。
+    expedition 非 None（远征章节 run）时附带远征摘要（章节进度/结算状态）。
     """
     reachable = map_data["routes"].get(run["position"], [])
     snap = None
@@ -984,6 +1264,7 @@ def _public_view(run, map_data, run_id, include_unlocks=True, rev=None):
         "reachable": [map_data["nodes"][n] for n in reachable],
         "map": _map_public(map_data, run["position"]),
         "unlocked_cards": get_profile_unlocked() if include_unlocks else None,
+        "expedition": expedition,
         "truncated": bool(run["battle"]["truncated"]) if run["in_battle"] and run["battle"] else bool(run.get("truncated", False)),
     }
     if rev is not None:

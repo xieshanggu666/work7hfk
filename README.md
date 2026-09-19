@@ -12,11 +12,18 @@
 - **战斗演出**：Phaser 场景按服务端结算顺序逐条播放（待机/攻击/受击/死亡动画、护盾与状态实时刷新），
   播放期间操作锁定，播完再应用权威快照同步血量/护盾/手牌，战斗结束衔接领奖
 - 服务端权威校验行动，防作弊；失败解锁新卡
+- **多章远征**：创建跨章节远征（默认 3 章），击败章节首领后携带牌组、锻造成长、遗物与金币
+  进入下一章（交接时休整回血 25%）；战败即结算远征并更新解锁，征服终章首领则远征通关；
+  章节存档/奖励交接/整程回放统一管理，推进章节走 request_id 幂等 + 状态守卫，
+  重复开章（400/409）与重复结算（状态机只流转一次）都被拦截
 - 中途可续局（`POST /api/runs` → 刷新 → 回到同一节点/战斗）；种子回放一致
 - **可交互整局回放**：动作日志升级为可 ▶播放 / ⏸暂停 / ◀单步 / 拖拽跳转 / 0.5–4× 倍速 的时间轴，
   逐步重建路线、战斗（Phaser 按结算顺序重演）、锻造与交易状态；记录规则版本与逐步校验点（可检出日志损坏/规则漂移），
   兼容无版本号的旧日志（裸卡牌 id）；回放全程只读隔离——不写存档、战败不发解锁
 - 服务端对无限连锁触发设上限防止死循环；领奖/锻造防重复（重复领取返回 409，不重复扣款）
+- **远征整程回放**：`GET /api/expeditions/{id}/replay` 返回远征事件时间线
+  （create/chapter_clear/advance/settle）+ 逐章完整可交互回放；章节 run 的初始状态由
+  create 事件携带的交接快照重建，校验点逐位比对；全程只读隔离——不写存档、不发解锁
 - 旧存档自动兼容：裸 id 牌组在首次载入（续局/行动）时迁移为卡牌实例结构，含战斗中存档
 - **并发一致性**：每个行动的「校验 → 存档 → 动作日志 → 战败解锁」在单个 SQLite 事务
   （`BEGIN IMMEDIATE` + WAL）内原子提交，任一写入失败整体回滚，杜绝写入失败/并发操作导致的
@@ -57,7 +64,9 @@ py -m pytest -q tests
 锻造同名卡独立成长、锻造贯通战斗/奖励/续局/回放、旧档迁移、
 商店库存确定性/续局一致、购买卡牌/遗物（扣款/售罄/失败回退）、移除指定实例（递增价/牌组下限）、
 交易贯通后续战斗与回放、**并发与原子提交（写入失败整体回滚、并发领奖/锻造/战败只生效一次、
-request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema 自动迁移、损坏日志/序号缺口容错）**。
+request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema 自动迁移、损坏日志/序号缺口容错）**、
+**多章远征（创建即开第 1 章、章节通关交接牌组/锻造/遗物/金币、推进章节防重复开章与 request_id 幂等、
+战败/终章通关结算且只结算一次、整程回放逐章校验点通过且只读隔离）**。
 
 ## API 摘要
 - `POST /api/runs {seed?}` 建局
@@ -71,6 +80,20 @@ request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema �
   `final_view` / `verification` / `isolated`；每个 `step` 含动作、类型/标题/摘要、
   结算事件 `events`、战斗结果，以及该步完成后的完整只读 `view`（与 `/resume` 同构）
 - `GET  /api/cards`、`/api/enemies`、`/api/map-preview?seed=` 元数据
+
+多章远征：
+- `POST /api/expeditions {seed?, chapters?}` 创建远征（默认 3 章）：远征记录与第 1 章 run
+  在同一事务落库；返回 `{expedition, run}`，run 视口携带 `expedition` 摘要（章节进度/结算状态）。
+- `GET  /api/expeditions/{id}` 远征视口 + 当前章节 run 视口（续远征入口）。
+- `POST /api/expeditions/{id}/advance {request_id?}` 进入下一章：仅当远征进行中且当前章
+  已通关；以交接快照（牌组/锻造/遗物/金币/生命，休整回血 25%）确定性开新章
+  （章节种子由远征种子派生）。重复推进 400、已结算 409、同 request_id 返回首次响应
+  （`duplicate:true`），绝不重复开章。
+- `GET  /api/expeditions/{id}/replay` 整程回放：远征事件时间线 + 逐章完整回放
+  （复用单局可交互回放，校验点逐章比对），全程只读。
+- 章节 run 就是普通 run（`/api/runs/{id}/act|resume|replay` 全部适用）；章节 run 结束时
+  （won/lost）与行动同一事务同步远征状态：非终章通关记录 chapter_clear 交接快照，
+  战败/终章通关结算远征（settle），已结算或非当前章节的重复触发直接跳过。
 
 锻造行动：`{action:"forge", card:<卡牌实例 uid>, branch:"sharpen"|"empower"|"refine"}`，
 花费 25 金币（`forge_cost` 随视口返回）；同一锻造节点仅可锻造一次，重复请求返回 409 且不扣款，
@@ -113,5 +136,11 @@ request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema �
   旧库启动自动补 `rev` 列与 `act_requests` 表。损坏的 `payload_json`（非法 JSON/NULL）
   在读取时降级为 `_corrupt` 行，回放标注 `error` 仍可播放其余步骤；序号缺口给出 `warning`
   与 `verification.seq_gaps`。
-- SQLite：`runs`（状态，含 rev 乐观版本、商店库存/交易记录）、`battle_events`（动作日志，
-  含 forge/shop 行）、`profile`（解锁卡）、`act_requests`（request_id → 首次响应，请求级幂等）。
+- SQLite：`runs`（状态，含 rev 乐观版本、商店库存/交易记录、expedition_id/chapter 远征归属）、
+  `battle_events`（动作日志，含 forge/shop 行）、`profile`（解锁卡）、
+  `act_requests`（request_id → 首次响应，请求级幂等）、
+  `expeditions`（远征：状态/章节进度/交接快照 carry_json/rev）、
+  `expedition_events`（远征事件：create/chapter_clear/advance/settle，整程回放时间线）。
+- 远征章节 run 的初始状态由 `_new_run_state(seed, carry)` 构造：在线开章与回放重建共用
+  同一函数，交接快照随章节 run 的 create 事件落库，回放无需读取远征表即可逐位复演；
+  章节种子 = f（远征种子， 章节号） 确定性派生，各章地图/洗牌独立但可复现。

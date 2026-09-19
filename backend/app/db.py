@@ -60,6 +60,29 @@ CREATE TABLE IF NOT EXISTS act_requests (
     created_at TEXT NOT NULL,
     PRIMARY KEY (run_id, request_id)
 );
+
+-- 多章远征：一条远征串起若干章节 run；carry_json 为最近一次章节交接快照
+CREATE TABLE IF NOT EXISTS expeditions (
+    id TEXT PRIMARY KEY,
+    seed INTEGER NOT NULL,
+    status TEXT NOT NULL,            -- in_progress / won / lost
+    chapter INTEGER NOT NULL,        -- 当前章节（1 起）
+    chapters_total INTEGER NOT NULL,
+    current_run_id TEXT NOT NULL,    -- 当前章节对应的 run
+    carry_json TEXT,                 -- 章节交接快照（牌组/锻造/遗物/金币/生命）
+    rev INTEGER NOT NULL DEFAULT 1,  -- 乐观版本号：推进章节/结算时 +1
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- 远征事件日志：create / chapter_clear / advance / settle，整程回放按序呈现
+CREATE TABLE IF NOT EXISTS expedition_events (
+    exp_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (exp_id, seq)
+);
 """
 
 
@@ -97,6 +120,10 @@ def init_db():
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
             if "rev" not in cols:
                 conn.execute("ALTER TABLE runs ADD COLUMN rev INTEGER NOT NULL DEFAULT 1")
+            if "expedition_id" not in cols:
+                # 多章远征：章节 run 归属的远征与章节序号（普通局为 NULL）
+                conn.execute("ALTER TABLE runs ADD COLUMN expedition_id TEXT")
+                conn.execute("ALTER TABLE runs ADD COLUMN chapter INTEGER")
             conn.commit()
         finally:
             conn.close()
@@ -150,21 +177,28 @@ class _Tx:
 
 
 # ---------- runs ----------
-def insert_run(conn, run_id, seed, status, position, map_data, state):
+def insert_run(conn, run_id, seed, status, position, map_data, state,
+               expedition_id=None, chapter=None):
     conn.execute(
-        "INSERT INTO runs(id,seed,status,position,map_json,state_json,rev,created_at,updated_at) "
-        "VALUES(?,?,?,?,?,?,1,datetime('now'),datetime('now'))",
+        "INSERT INTO runs(id,seed,status,position,map_json,state_json,rev,"
+        "expedition_id,chapter,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,1,?,?,datetime('now'),datetime('now'))",
         (run_id, seed, status, position,
          json.dumps(map_data, ensure_ascii=False),
-         json.dumps(state, ensure_ascii=False)),
+         json.dumps(state, ensure_ascii=False),
+         expedition_id, chapter),
     )
 
 
 def _row_to_run(row):
+    keys = row.keys()
     return {
         "id": row["id"], "seed": row["seed"], "status": row["status"],
         "position": row["position"], "map": json.loads(row["map_json"]),
         "state": json.loads(row["state_json"]), "rev": row["rev"],
+        # 旧库在 init_db 迁移后才有这两列；普通局为 None
+        "expedition_id": row["expedition_id"] if "expedition_id" in keys else None,
+        "chapter": row["chapter"] if "chapter" in keys else None,
     }
 
 
@@ -290,6 +324,103 @@ def upsert_profile_conn(conn, unlocked_cards):
         "ON CONFLICT(id) DO UPDATE SET unlocked_cards=excluded.unlocked_cards",
         (json.dumps(unlocked_cards, ensure_ascii=False),),
     )
+
+
+# ---------- 多章远征 ----------
+def insert_expedition(conn, exp_id, seed, chapters_total, current_run_id, carry=None):
+    conn.execute(
+        "INSERT INTO expeditions(id,seed,status,chapter,chapters_total,current_run_id,"
+        "carry_json,rev,created_at,updated_at) "
+        "VALUES(?,?,'in_progress',1,?,?,?,1,datetime('now'),datetime('now'))",
+        (exp_id, seed, chapters_total, current_run_id,
+         json.dumps(carry, ensure_ascii=False) if carry is not None else None),
+    )
+
+
+def _row_to_expedition(row):
+    return {
+        "id": row["id"], "seed": row["seed"], "status": row["status"],
+        "chapter": row["chapter"], "chapters_total": row["chapters_total"],
+        "current_run_id": row["current_run_id"],
+        "carry": json.loads(row["carry_json"]) if row["carry_json"] else None,
+        "rev": row["rev"],
+    }
+
+
+def load_expedition(exp_id):
+    """读取远征（含交接快照）。使用共享连接，读不到未提交数据。"""
+    with _lock:
+        conn = _conn
+        if conn is None:
+            init_db()
+            conn = _conn
+        row = conn.execute("SELECT * FROM expeditions WHERE id=?", (exp_id,)).fetchone()
+    return None if row is None else _row_to_expedition(row)
+
+
+def save_expedition_conn(conn, exp_id, status, chapter, current_run_id, carry, expected_rev=None):
+    """在事务内推进远征状态并 rev+1；expected_rev 非 None 时做乐观并发检查。"""
+    cur = conn.execute(
+        "UPDATE expeditions SET status=?, chapter=?, current_run_id=?, carry_json=?, "
+        "rev=rev+1, updated_at=datetime('now') WHERE id=? AND (? IS NULL OR rev=?)",
+        (status, chapter, current_run_id,
+         json.dumps(carry, ensure_ascii=False) if carry is not None else None,
+         exp_id, expected_rev, expected_rev),
+    )
+    if cur.rowcount == 0:
+        raise ConcurrentModification(f"expedition {exp_id} changed concurrently (rev {expected_rev})")
+
+
+def next_expedition_seq_conn(conn, exp_id):
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq),0) AS m FROM expedition_events WHERE exp_id=?", (exp_id,)
+    ).fetchone()
+    return row["m"] + 1
+
+
+def append_expedition_event_conn(conn, exp_id, seq, kind, payload):
+    conn.execute(
+        "INSERT INTO expedition_events(exp_id,seq,kind,payload_json) VALUES(?,?,?,?)",
+        (exp_id, seq, kind, json.dumps(payload, ensure_ascii=False)),
+    )
+
+
+def load_expedition_events(exp_id):
+    """读取远征事件日志（只读）；损坏行降级为 _corrupt，不拖垮整程回放。"""
+    with _lock:
+        conn = _conn
+        if conn is None:
+            init_db()
+            conn = _conn
+        rows = conn.execute(
+            "SELECT seq, kind, payload_json FROM expedition_events WHERE exp_id=? ORDER BY seq",
+            (exp_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        raw = r["payload_json"]
+        try:
+            payload = json.loads(raw) if raw is not None else {}
+        except (ValueError, TypeError):
+            payload = {"_corrupt": True, "_raw": raw[:200] if isinstance(raw, str) else None}
+        if not isinstance(payload, dict):
+            payload = {"_corrupt": True}
+        out.append({"seq": r["seq"], "kind": r["kind"], "payload": payload})
+    return out
+
+
+def list_expedition_runs(exp_id):
+    """远征的章节 run 列表（按章节序），用于统一管理章节存档与整程回放。"""
+    with _lock:
+        conn = _conn
+        if conn is None:
+            init_db()
+            conn = _conn
+        rows = conn.execute(
+            "SELECT id, chapter, status FROM runs WHERE expedition_id=? ORDER BY chapter",
+            (exp_id,),
+        ).fetchall()
+    return [{"run_id": r["id"], "chapter": r["chapter"], "status": r["status"]} for r in rows]
 
 
 # ---------- 独立包装：迁移/测试/运维用（单表原子即可的场景） ----------

@@ -6,6 +6,16 @@ class CreateRunRequest(BaseModel):
     seed: Optional[int] = None
 
 
+class CreateExpeditionRequest(BaseModel):
+    seed: Optional[int] = None
+    chapters: Optional[int] = None  # 章节数（默认 3，上限见 service.MAX_CHAPTERS）
+
+
+class AdvanceRequest(BaseModel):
+    # 请求级幂等：同一令牌重复/并发提交返回首次响应，不会重复开章
+    request_id: Optional[str] = None
+
+
 class ActRequest(BaseModel):
     action: str
     node: Optional[str] = None

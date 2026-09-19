@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import db
-from .routers import meta, run
+from .routers import expedition, meta, run
 
 app = FastAPI(title="卡牌闯关 API")
 
@@ -21,6 +21,7 @@ def _startup():
 
 app.include_router(meta.router)
 app.include_router(run.router)
+app.include_router(expedition.router)
 
 
 @app.get("/api/health")

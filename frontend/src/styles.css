@@ -288,3 +288,26 @@ button.mini { font-size: 12px; padding: 4px 8px; }
 .forgeinst.readonly, .shopitem.readonly, .roption.readonly { cursor: default; }
 .forgeinst.readonly.sel, .roption.readonly { border-color: #4d73b8; }
 .replaycard { max-width: 420px; text-align: center; }
+
+/* ============ 多章远征 ============ */
+.exp-chip { background: #3a2f18; color: #ffd166; border: 1px solid #6b5518; }
+.exp-chip.won { background: #1f3d2a; color: #6fe39a; border-color: #2f6b44; }
+.exp-chip.lost { background: #432025; color: #ff8e8e; border-color: #6b2f2f; }
+.exp-status { font-size: 12px; padding: 2px 8px; border-radius: 6px; background: #2c2c44; color: #cfd6ff; }
+.exp-status.won { background: #1f3d2a; color: #6fe39a; }
+.exp-status.lost { background: #432025; color: #ff8e8e; }
+.exp-tabs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.exp-tab.on { background: #2c3f63; color: #cfe2ff; border-color: #4d73b8; }
+.exp-tab-bad { font-style: normal; color: #ff8e8e; margin-left: 4px; }
+.exp-events {
+  display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 16px;
+  border-bottom: 1px solid #26263c; background: #15151f;
+}
+.exp-event {
+  font-size: 12px; color: #aab; background: #1b1b28; border: 1px solid #28283d;
+  border-radius: 6px; padding: 2px 8px;
+}
+.exp-event.settle { color: #ffd166; border-color: #6b5518; }
+.exp-event.chapter_clear { color: #6fe39a; border-color: #2f6b44; }
+.exp-player { flex: 1; min-height: 0; display: flex; }
+.exp-player .replay-shell { width: 100%; height: 100%; margin: 0; border: none; border-radius: 0; }

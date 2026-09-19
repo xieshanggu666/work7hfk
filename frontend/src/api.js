@@ -53,6 +53,32 @@ export const api = {
   },
   replay: (id) => j(`${BASE}/runs/${id}/replay`),
 
+  // ---------- 多章远征 ----------
+  async createExpedition(seed, chapters) {
+    const data = await j(`${BASE}/expeditions`, {
+      method: 'POST',
+      body: JSON.stringify({ seed, chapters }),
+    })
+    if (Number.isInteger(data.run?.rev)) setExpectedRev(data.run.rev)
+    return data
+  },
+  async getExpedition(id) {
+    const data = await j(`${BASE}/expeditions/${id}`)
+    if (Number.isInteger(data.run?.rev)) setExpectedRev(data.run.rev)
+    return data
+  },
+  expeditionReplay: (id) => j(`${BASE}/expeditions/${id}/replay`),
+  async advanceExpedition(id, { retryKey } = {}) {
+    // 与 run 行动同理：request_id 幂等，重复/并发提交返回首次结果，不会重复开章
+    const requestId = retryKey || newRequestId()
+    const data = await j(`${BASE}/expeditions/${id}/advance`, {
+      method: 'POST',
+      body: JSON.stringify({ request_id: requestId }),
+    })
+    if (Number.isInteger(data.run?.rev)) setExpectedRev(data.run.rev)
+    return data
+  },
+
   act: async (id, action, { retryKey } = {}) => {
     // retryKey：调用方在“重试同一个意图”时显式传入；缺省每个调用一个新令牌
     const requestId = retryKey || newRequestId()

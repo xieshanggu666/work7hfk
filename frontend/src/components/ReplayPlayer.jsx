@@ -17,7 +17,8 @@ const FRAME_HOLD_MS = 650
 
 // 整局可交互回放：播放 / 暂停 / 上一步 / 下一步 / 拖拽跳转 / 倍速 / 时间轴。
 // 数据来自 GET /replay 的 steps（后端已逐步重建状态并校验），本组件只读展示。
-export default function ReplayPlayer({ runId, onClose }) {
+// embedded + replayData：由父组件（如远征整程回放）提供已加载的数据并去掉全屏外壳。
+export default function ReplayPlayer({ runId, onClose, embedded = false, replayData = null }) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [idx, setIdx] = useState(0)          // 当前帧下标（0..steps-1）
@@ -29,10 +30,18 @@ export default function ReplayPlayer({ runId, onClose }) {
   const playingRef = useRef(false)
 
   useEffect(() => {
+    if (replayData) {
+      // 父组件直供数据（远征逐章回放）：不重复请求
+      setData(replayData)
+      setErr('')
+      setIdx(0)
+      return undefined
+    }
+    if (!runId) return undefined
     let alive = true
     api.replay(runId).then((d) => { if (alive) setData(d) }).catch((e) => alive && setErr(e.message))
     return () => { alive = false; stopTimer() }
-  }, [runId])
+  }, [runId, replayData])
 
   const steps = data?.steps || []
   const step = steps[idx]
@@ -135,26 +144,27 @@ export default function ReplayPlayer({ runId, onClose }) {
   }, [steps, filter])
 
   if (err) {
-    return (
-      <div className="overlay">
-        <div className="replaycard panel">
-          <h2>整局回放</h2>
-          <div className="error">{err}</div>
-          <button className="primary" onClick={onClose}>关闭</button>
-        </div>
+    const errCard = (
+      <div className="replaycard panel">
+        <h2>整局回放</h2>
+        <div className="error">{err}</div>
+        {!embedded && <button className="primary" onClick={onClose}>关闭</button>}
       </div>
     )
+    return embedded
+      ? errCard
+      : <div className="overlay">{errCard}</div>
   }
   if (!data) {
-    return <div className="overlay"><div className="replaycard panel">加载回放数据…</div></div>
+    const loading = <div className="replaycard panel">加载回放数据…</div>
+    return embedded ? loading : <div className="overlay">{loading}</div>
   }
 
   const v = data.verification
   const progress = steps.length ? ((idx + 1) / steps.length) * 100 : 0
 
-  return (
-    <div className="overlay replay-overlay-full">
-      <div className="replay-shell">
+  const shell = (
+    <div className="replay-shell">
         <header className="replay-top">
           <div className="replay-title">
             🎬 整局回放
@@ -172,7 +182,7 @@ export default function ReplayPlayer({ runId, onClose }) {
             {v.error > 0 && <i className="chk bad">{v.error} 错误</i>}
             <span className="iso">🔒 只读隔离 · 不写存档 · 不发解锁</span>
           </div>
-          <button className="mini" onClick={onClose}>退出回放 ✕</button>
+          {!embedded && <button className="mini" onClick={onClose}>退出回放 ✕</button>}
         </header>
 
         <div className="replay-body">
@@ -272,7 +282,9 @@ export default function ReplayPlayer({ runId, onClose }) {
           </label>
         </footer>
         <div className="replay-progress"><span style={{ width: `${progress}%` }} /></div>
-      </div>
     </div>
   )
+  return embedded
+    ? shell
+    : <div className="overlay replay-overlay-full">{shell}</div>
 }
