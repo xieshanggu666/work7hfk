@@ -46,6 +46,14 @@ export const api = {
     setExpectedRev(data.rev)
     return data
   },
+  async createExpedition(seed, chapters) {
+    const data = await j(`${BASE}/expeditions`, {
+      method: 'POST',
+      body: JSON.stringify({ seed, chapters }),
+    })
+    setExpectedRev(data.rev)
+    return data
+  },
   async resume(id) {
     const data = await j(`${BASE}/runs/${id}/resume`)
     setExpectedRev(data.rev)

@@ -146,6 +146,7 @@ function fmtEvent(ev) {
   if (ev.result) {
     if (ev.result === 'lost') return '💀 战败…'
     if (ev.result === 'run_won') return '🏆 通关！'
+    if (ev.result === 'chapter_clear') return `🚩 第 ${ev.chapter} 章通关！`
     return '🎉 胜利！'
   }
   if (ev.snapshot) return ''

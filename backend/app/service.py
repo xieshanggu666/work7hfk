@@ -18,7 +18,16 @@ from .forging import FORGE_COST, effective_card, branch_name
 
 # 规则版本：引擎/结算/存档结构发生语义变化时递增。
 # 建局写入 run 状态、每个动作事件携带 ver；回放据此标记录制版本与旧日志兼容。
-RULES_VERSION = "2.0.0"
+# 3.0.0：多章远征（expedition 状态字段、next_chapter 行动、按章节派生地图、战败多解锁）
+RULES_VERSION = "3.0.0"
+
+# 多章远征：章节数范围与章节通关交接奖励
+EXPEDITION_MIN_CHAPTERS = 2
+EXPEDITION_MAX_CHAPTERS = 9
+EXPEDITION_DEFAULT_CHAPTERS = 3
+CHAPTER_CLEAR_GOLD_BASE = 30   # 章节通关金币：BASE + PER * 已通关章号
+CHAPTER_CLEAR_GOLD_PER = 15
+CHAPTER_HEAL_RATIO = 0.4       # 开章营地休整：回复 max_health 的 40%
 
 # 初始牌组：卡牌 id 列表；建局时展开为独立实例（同名卡各持一份成长状态）
 START_DECK = ["strike", "strike", "strike", "strike", "guard", "guard", "guard"]
@@ -50,9 +59,9 @@ def _make_instances(ids):
     return uids, instances
 
 
-def _new_run_state(seed):
+def _new_run_state(seed, expedition_chapters=None):
     deck_uids, instances = _make_instances(START_DECK)
-    return {
+    state = {
         "seed": seed,
         "rules_version": RULES_VERSION,
         "status": "in_progress",
@@ -75,6 +84,18 @@ def _new_run_state(seed):
         "events_log": [],
         "truncated": False,
     }
+    if expedition_chapters:
+        # 多章远征：一个 run 承载全部章节，共用一条动作日志（整程回放天然覆盖）。
+        # 章节存档统一保存在本字段：进度/待开章/结算标记/逐章结算记录。
+        state["expedition"] = {
+            "enabled": True,
+            "chapter": 1,
+            "total_chapters": expedition_chapters,
+            "pending_next": False,   # 本章首领已击败、待开下一章（防重复开章的幂等键）
+            "settled": False,        # 整程已结算（通关/战败只结算一次）
+            "history": [],           # 逐章结算记录：[{chapter, result, battles, ...}]
+        }
+    return state
 
 
 def _migrate_state(run):
@@ -116,6 +137,8 @@ def _migrate_state(run):
         changed = True
     run.setdefault("forge_claimed", True)
     run.setdefault("shop", None)
+    # 注意：不给旧档补 expedition 字段——它会进入状态校验点，补上会让旧档
+    # 后续步骤的 ckpt 与回放起点（无该字段）天然不一致。一律用 run.get("expedition")。
     return changed
 
 
@@ -137,6 +160,51 @@ def create_run(seed=None):
         db.insert_run(conn, run_id, state["seed"], state["status"], state["position"], map_data, state)
         db.append_event_conn(conn, run_id, 1, "create", {
             "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
+        })
+    return _public_view(state, map_data, run_id, rev=1)
+
+
+# ---------- 多章远征 ----------
+def _chapter_map_seed(seed, chapter):
+    """远征各章地图种子：第 1 章沿用建局种子，后续章节确定性派生（不重复存图）。"""
+    if chapter <= 1:
+        return seed
+    return (seed * 1000003 + chapter * 7919) & 0x7FFFFFFF
+
+
+def _run_map(run, stored_map):
+    """当前章节地图：远征按 (种子, 章节) 确定性重生成；普通局直接用存档地图。
+
+    在线行动/续局/回放共用本函数，保证三条路径看到的永远是同一张章节地图。
+    """
+    exp = run.get("expedition")
+    if exp and exp.get("enabled"):
+        return mapgen.generate_map(_chapter_map_seed(run["seed"], exp.get("chapter", 1)))
+    return stored_map
+
+
+def create_expedition(seed=None, chapters=EXPEDITION_DEFAULT_CHAPTERS):
+    """创建跨章节远征：一个 run 承载全部章节，共用一条动作日志。
+
+    牌组/锻造成长/遗物/金币跨章携带；章节地图按种子派生，整程回放复用
+    现有的逐步推演与校验点机制（next_chapter 只是日志里的一个动作）。
+    """
+    if chapters is None:
+        chapters = EXPEDITION_DEFAULT_CHAPTERS
+    if not isinstance(chapters, int) or isinstance(chapters, bool) \
+            or not (EXPEDITION_MIN_CHAPTERS <= chapters <= EXPEDITION_MAX_CHAPTERS):
+        raise InvalidAction(
+            f"chapters must be an int in {EXPEDITION_MIN_CHAPTERS}..{EXPEDITION_MAX_CHAPTERS}")
+    seed = seed if seed is not None else random.randint(0, 2**31 - 1)
+    run_id = uuid.uuid4().hex[:12]
+    state = _new_run_state(seed, expedition_chapters=chapters)
+    map_data = mapgen.generate_map(seed)  # 第 1 章地图；后续章节按种子派生，不落库
+    # 与普通建局一致：存档与首条日志同事务原子提交
+    with db.transaction() as conn:
+        db.insert_run(conn, run_id, state["seed"], state["status"], state["position"], map_data, state)
+        db.append_event_conn(conn, run_id, 1, "create", {
+            "seed": state["seed"], "ver": RULES_VERSION, "ckpt": state_checkpoint(state),
+            "expedition": {"chapters": chapters},
         })
     return _public_view(state, map_data, run_id, rev=1)
 
@@ -235,13 +303,14 @@ def act(run_id, action):
                 raise StaleState(f"state version conflict: expected {expected_rev}, actual {rec['rev']}")
 
             run = rec["state"]
-            map_data = rec["map"]
             # 旧档兼容：首次载入即迁移到卡牌实例结构（随本次行动结果一起原子落库）。
             # migrated=True 时本步状态结构与回放起点（已是新结构）不同，校验点天然
             # 不可比，事件打 migrated 标记 -> 回放按 legacy 处理本步，后续步骤仍严格校验。
             migrated = _migrate_state(run)
             if run["status"] != "in_progress":
                 raise InvalidAction(f"run already ended ({run['status']})")
+            # 远征按当前章节派生地图（普通局即存档地图）
+            map_data = _run_map(run, rec["map"])
 
             # 纯推演：不触碰数据库；失败抛异常 -> 事务回滚，零副作用
             log = _apply_action(run, a, action, map_data, grant_unlocks=True)
@@ -267,7 +336,8 @@ def act(run_id, action):
             if pending_unlock is not None:
                 db.upsert_profile_conn(conn, pending_unlock)
 
-            response = {"seq": seq, "log": log, "run": _public_view(run, map_data, run_id),
+            response = {"seq": seq, "log": log,
+                        "run": _public_view(run, _run_map(run, rec["map"]), run_id),
                         "rev": rec["rev"] + 1, "duplicate": False}
             db.put_idempotent(conn, run_id, request_id, seq, response)
             return response
@@ -295,10 +365,16 @@ def _apply_action(run, a, action, map_data, grant_unlocks=False):
         return _shop_buy(run, action.get("kind"), action.get("sku"))
     if a == "shop_remove":
         return _shop_remove(run, action.get("card"))
+    if a == "next_chapter":
+        return _next_chapter(run)
     raise InvalidAction(f"unknown action {a}")
 
 
 def _choose_node(run, map_data, node):
+    exp = run.get("expedition")
+    if exp and exp.get("enabled") and exp.get("pending_next"):
+        # 本章首领已击败：必须先开下一章（章节间不能在旧地图上继续走点）
+        raise InvalidAction("chapter cleared: advance to the next chapter first")
     from_current = map_data["routes"].get(run["position"], [])
     if run["position"] != mapgen.BOSS and node not in from_current:
         raise InvalidAction(f"node {node} unreachable from {run['position']}")
@@ -437,20 +513,94 @@ def _after_battle_step(run, battle, log, grant_unlocks=True):
         run["reward_claimed"] = False
         log.append({"result": "won", "snapshot": snap})
         if enemy.get("boss"):
-            run["status"] = "won"
             run["reward_options"] = []
             run["reward_claimed"] = True
-            log.append({"result": "run_won"})
+            exp = run.get("expedition")
+            if exp and exp.get("enabled"):
+                _settle_chapter_clear(run, exp, log)
+            else:
+                run["status"] = "won"
+                log.append({"result": "run_won"})
     else:
         run["battle"] = None
         run["status"] = "lost"
         log.append({"result": "lost", "snapshot": snap})
+        # 远征战败：整程结算（只结算一次），解锁数 = 已通关章节数（至少 1）
+        cleared = 0
+        exp = run.get("expedition")
+        if exp and exp.get("enabled") and not exp.get("settled"):
+            exp["settled"] = True
+            cleared = sum(1 for h in exp["history"] if h.get("result") == "cleared")
+            exp["history"].append({"chapter": exp["chapter"], "result": "lost",
+                                   "battles": run["battle_index"]})
         # 仅在线路径计算失败解锁；回放/模拟（grant_unlocks=False）不产生 profile 变更
         if grant_unlocks:
-            new_profile, changed = _grant_unlock_on_loss(run)
+            new_profile, changed = _grant_unlock_on_loss(run, count=max(1, cleared))
             if changed:
                 run[_PENDING_UNLOCK_KEY] = new_profile
     return log
+
+
+# ---------- 多章远征：章节结算与开章 ----------
+def _settle_chapter_clear(run, exp, log):
+    """章节首领被击败：记录本章通关；终章则整程结算（won），否则挂起待开下一章。
+
+    非终章不结束 run：status 保持 in_progress，由 next_chapter 行动完成
+    奖励交接并推进章节；pending_next 是防重复开章的幂等键。
+    """
+    chapter = exp["chapter"]
+    exp["history"].append({"chapter": chapter, "result": "cleared",
+                           "battles": run["battle_index"]})
+    if chapter >= exp["total_chapters"]:
+        # 终章通关：整程远征结算（只结算一次）
+        exp["settled"] = True
+        run["status"] = "won"
+        log.append({"result": "run_won"})
+    else:
+        exp["pending_next"] = True
+        log.append({"result": "chapter_clear", "chapter": chapter,
+                    "next_chapter": chapter + 1})
+
+
+def _next_chapter(run):
+    """开下一章：奖励交接（通关金币 + 营地休整）后携带成长资产进入新章节。
+
+    携带：牌组（含同名卡独立实例）、锻造成长、遗物、金币、当前生命（+休整）。
+    重置：位置/战斗/奖励/锻造/商店等章节内状态。章节地图按 (种子, 章节) 派生，
+    不在这里生成或落库。
+    """
+    exp = run.get("expedition")
+    if not exp or not exp.get("enabled"):
+        raise InvalidAction("not an expedition run")
+    if exp.get("settled"):
+        raise InvalidAction("expedition already settled")
+    if not exp.get("pending_next"):
+        # 防重复开章：本章首领尚未击败，或下一章已经开过 -> 409
+        raise DuplicateReward("no cleared chapter awaiting advance")
+    chapter = exp["chapter"]
+    # 奖励交接：章节通关金币 + 营地休整治疗（确定性，随日志可回放）
+    bonus = CHAPTER_CLEAR_GOLD_BASE + CHAPTER_CLEAR_GOLD_PER * chapter
+    heal = max(1, int(run["max_health"] * CHAPTER_HEAL_RATIO))
+    run["gold"] += bonus
+    run["health"] = min(run["max_health"], run["health"] + heal)
+    for h in exp["history"]:
+        if h.get("chapter") == chapter and h.get("result") == "cleared":
+            h["gold_bonus"] = bonus
+            h["heal"] = heal
+    exp["pending_next"] = False
+    exp["chapter"] = chapter + 1
+    # 章节存档重置：位置/战斗/节点一次性状态；成长资产全部保留
+    run["position"] = "start"
+    run["in_battle"] = False
+    run["battle"] = None
+    run["reward_options"] = []
+    run["reward_claimed"] = True
+    run["forge_claimed"] = True
+    run["shop"] = None
+    run["events_log"].append({"at": f"chapter:{chapter}->{chapter + 1}",
+                              "gold_bonus": bonus, "heal": heal})
+    return [{"chapter_advanced": {"chapter": chapter + 1, "total": exp["total_chapters"],
+                                  "gold_bonus": bonus, "heal": heal, "gold": run["gold"]}}]
 
 
 def _claim_reward(run, option_idx):
@@ -613,9 +763,10 @@ def _shop_remove(run, card_uid):
         lambda res: {"type": "remove", **res, "price": cost, "gold_left": run["gold"]})
 
 
-def _grant_unlock_on_loss(run):
+def _grant_unlock_on_loss(run, count=1):
     """在线战败：纯计算本次解锁结果（不写库）。
 
+    普通局解锁 1 张；远征按已通关章节数解锁多张（count）。
     返回 (新 profile, 是否有变化)；由 act 的原子事务与存档/日志一起提交。
     回放路径（grant_unlocks=False）不会调用本函数。
     """
@@ -626,9 +777,11 @@ def _grant_unlock_on_loss(run):
     if not pool:
         return None, False
     rng = random.Random(run["seed"] + run["battle_index"])
-    cid = pool[rng.randrange(len(pool))]
-    unlocked.append(cid)
-    locked.remove(cid)
+    # 逐张不放回抽取；count=1 时与旧版逐位一致（同一 rng 序列的首抽）
+    for _ in range(min(max(1, count), len(pool))):
+        cid = pool.pop(rng.randrange(len(pool)))
+        unlocked.append(cid)
+        locked.remove(cid)
     return {"unlocked": unlocked, "locked": locked}, True
 
 
@@ -654,7 +807,7 @@ def resume(run_id):
                 rev = row["rev"] + 1
             else:
                 rev = row["rev"]
-            return _public_view(state, map_data, run_id, rev=rev)
+            return _public_view(state, _run_map(state, map_data), run_id, rev=rev)
 
 
 # ---------- 规则版本与校验点 ----------
@@ -698,8 +851,13 @@ def replay(run_id):
     # 只读已持久化日志：经共享连接读取，保证读到的都是已提交事务
     events = db.load_events(run_id)
 
-    # 回放起点：重新构造建局时的初始状态（不读、不写、不迁移真实存档）
-    sim = _new_run_state(seed)
+    # 回放起点：重新构造建局时的初始状态（不读、不写、不迁移真实存档）。
+    # 远征局按存档里的远征配置（章节数）重建初始状态；章节进度由日志推演得出。
+    exp_cfg = rec["state"].get("expedition") or {}
+    sim = _new_run_state(
+        seed,
+        expedition_chapters=exp_cfg.get("total_chapters") if exp_cfg.get("enabled") else None,
+    )
     initial_ckpt = state_checkpoint(sim)
 
     steps = []
@@ -741,7 +899,9 @@ def replay(run_id):
             pass
         else:
             try:
-                log = _apply_action(sim, a, payload, map_data, grant_unlocks=False)
+                # 远征：按该步所处章节派生地图（next_chapter 前的步仍属上一章）
+                log = _apply_action(sim, a, payload, _run_map(sim, map_data),
+                                    grant_unlocks=False)
             except Exception as e:  # 损坏/越权动作不抹掉整段回放：断在此步并标注
                 error = f"{type(e).__name__}: {e}"
                 skipped_errors += 1
@@ -760,17 +920,18 @@ def replay(run_id):
 
         # 事件与在线 /act 返回的 log 同构（含 snapshot 校正点），前端播放器可复用
         # 同一套结算事件驱动；帧 view 本身已携带权威状态，跳转时直接落帧无需放动画。
+        frame_map = _run_map(sim, map_data)  # 该步完成后的章节地图（开章步即新章地图）
         anim_events = [dict(x) for x in log]
         steps.append({
             "seq": ev["seq"],
             "action": a,
             "payload": payload,
             "kind": _step_kind(sim, a, payload, log),
-            "title": _step_title(sim, map_data, a, payload, log),
+            "title": _step_title(sim, frame_map, a, payload, log),
             "summary": _step_summary(a, payload, log),
             "events": anim_events,
             "result": _step_result(log),
-            "view": _public_view(sim, map_data, run_id, include_unlocks=False),
+            "view": _public_view(sim, frame_map, run_id, include_unlocks=False),
             "check": status,
             "legacy": is_legacy or migrated_step,
             "migrated": migrated_step,
@@ -792,7 +953,7 @@ def replay(run_id):
         "legacy": legacy_steps > 0 or not recorded_versions,
         "initial": {"checkpoint": initial_ckpt},
         "steps": steps,
-        "final_view": _public_view(sim, map_data, run_id, include_unlocks=False),
+        "final_view": _public_view(sim, _run_map(sim, map_data), run_id, include_unlocks=False),
         "verification": {
             "ok": sum(c["status"] == "ok" for c in checks),
             "legacy": sum(c["status"] == "legacy" for c in checks),
@@ -825,6 +986,8 @@ def _step_kind(sim, action, payload, log):
         return "forge"
     if action in ("shop_buy", "shop_remove"):
         return "trade"
+    if action == "next_chapter":
+        return "chapter"
     if action == "create":
         return "create"
     return "other"
@@ -847,7 +1010,14 @@ def _card_name(cid):
 
 def _step_title(sim, map_data, action, payload, log):
     if action == "create":
-        return "建局"
+        exp = (payload.get("expedition") or {})
+        return f"建局（远征 {exp['chapters']} 章）" if exp.get("chapters") else "建局"
+    if action == "next_chapter":
+        adv = next((x.get("chapter_advanced") for x in log
+                    if isinstance(x, dict) and x.get("chapter_advanced")), None)
+        if adv:
+            return f"进入第 {adv['chapter']} / {adv['total']} 章"
+        return "进入下一章"
     if action == "choose_node":
         node = payload.get("node")
         return f"前往{_node_label(map_data, node)}节点"
@@ -879,6 +1049,12 @@ def _step_title(sim, map_data, action, payload, log):
 
 def _step_summary(action, payload, log):
     """时间轴上的简短状态变化描述（金币/牌组/战斗结果/交易）。"""
+    if action == "next_chapter":
+        adv = next((x.get("chapter_advanced") for x in log
+                    if isinstance(x, dict) and x.get("chapter_advanced")), None)
+        if adv:
+            return f"通关金币 +{adv['gold_bonus']}，休整 +{adv['heal']} 生命"
+        return ""
     if action == "shop_buy" or action == "shop_remove":
         tx = next((x.get("shop_tx") for x in log if isinstance(x, dict) and x.get("shop_tx")), None)
         if tx:
@@ -895,6 +1071,8 @@ def _step_summary(action, payload, log):
             return "战斗失败"
         if r == "run_won":
             return "通关！"
+        if r == "chapter_clear":
+            return "章节通关"
         dmg = sum(x.get("value", 0) for x in log
                   if isinstance(x, dict) and x.get("action") in ("damage", "echo_damage"))
         if dmg:
@@ -925,6 +1103,21 @@ def _hand_public(run, bstate):
             "forges": list(inst.get("forges", [])),
         })
     return out
+
+
+def _expedition_public(run):
+    """远征视口：章节进度/待开章/结算标记/逐章结算记录（普通局为 None）。"""
+    exp = run.get("expedition")
+    if not exp or not exp.get("enabled"):
+        return None
+    return {
+        "enabled": True,
+        "chapter": exp["chapter"],
+        "total_chapters": exp["total_chapters"],
+        "pending_next": bool(exp.get("pending_next")),
+        "settled": bool(exp.get("settled")),
+        "history": [dict(h) for h in exp.get("history", [])],
+    }
 
 
 def _public_view(run, map_data, run_id, include_unlocks=True, rev=None):
@@ -981,6 +1174,7 @@ def _public_view(run, map_data, run_id, include_unlocks=True, rev=None):
         "shop": shop_mod.public_view(run.get("shop")),
         "in_battle": run["in_battle"],
         "battle": snap,
+        "expedition": _expedition_public(run),
         "reachable": [map_data["nodes"][n] for n in reachable],
         "map": _map_public(map_data, run["position"]),
         "unlocked_cards": get_profile_unlocked() if include_unlocks else None,

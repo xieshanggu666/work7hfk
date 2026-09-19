@@ -91,6 +91,14 @@ button.mini { font-size: 12px; padding: 4px 8px; }
 
 .unlockgrid { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { background: #333452; padding: 3px 8px; border-radius: 12px; font-size: 12px; }
+.chip.exp { background: #2c3f63; color: #cfe2ff; }
+.chip.cleared { background: #1f3d2a; color: #6fe39a; }
+.chip.lost { background: #432025; color: #ff8e8e; }
+.exphistory { margin: 10px 0 4px; }
+.exphistory h3 { font-size: 14px; margin: 0 0 8px; color: #aab; }
+.expchips { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.hintline { font-size: 12px; color: #889; margin: 6px 0 0; }
+.chapterhint { color: #aab; font-size: 13px; }
 
 /* 地图 */
 .map h3 { margin-bottom: 12px; }
@@ -228,6 +236,7 @@ button.mini { font-size: 12px; padding: 4px 8px; }
 .rc-summary { color: #99a; font-size: 12px; margin-top: 4px; }
 .rc-result { margin-top: 8px; font-weight: 700; font-size: 13px; padding: 4px 8px; border-radius: 6px; display: inline-block; }
 .rc-result.won, .rc-result.run_won { background: #1f3d2a; color: #6fe39a; }
+.rc-result.chapter_clear { background: #20354d; color: #7ec8ff; }
 .rc-result.lost { background: #432025; color: #ff8e8e; }
 
 .replay-filters { display: flex; gap: 6px; padding: 8px 10px; flex-wrap: wrap; border-bottom: 1px solid #26263c; }

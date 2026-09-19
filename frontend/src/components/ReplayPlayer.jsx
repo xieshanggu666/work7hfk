@@ -5,11 +5,11 @@ import ReplayStage from './ReplayStage.jsx'
 
 const KIND_LABEL = {
   create: '建局', route: '路线', battle_entry: '进入战斗', battle: '战斗',
-  reward: '奖励', forge: '锻造', trade: '交易', other: '其他',
+  reward: '奖励', forge: '锻造', trade: '交易', chapter: '开章', other: '其他',
 }
 const KIND_ICON = {
   create: '🏕️', route: '🧭', battle_entry: '🚪', battle: '⚔️',
-  reward: '🎁', forge: '🔨', trade: '🛒', other: '•',
+  reward: '🎁', forge: '🔨', trade: '🛒', chapter: '🚩', other: '•',
 }
 const SPEEDS = [0.5, 1, 2, 4]
 // 每个动作帧的基础停留毫秒（倍速缩放）；战斗帧的结算事件另走 Phaser 动画队列
@@ -200,13 +200,16 @@ export default function ReplayPlayer({ runId, onClose }) {
               {step?.summary && <div className="rc-summary">{step.summary}</div>}
               {step?.result && (
                 <div className={`rc-result ${step.result}`}>
-                  {step.result === 'run_won' ? '🏆 通关' : step.result === 'won' ? '🎉 战斗胜利' : '💀 战斗失败'}
+                  {step.result === 'run_won' ? '🏆 通关'
+                    : step.result === 'won' ? '🎉 战斗胜利'
+                    : step.result === 'chapter_clear' ? '🚩 章节通关'
+                    : '💀 战斗失败'}
                 </div>
               )}
             </div>
 
             <div className="replay-filters">
-              {['all', 'route', 'battle', 'reward', 'forge', 'trade'].map((k) => (
+              {['all', 'route', 'battle', 'reward', 'forge', 'trade', 'chapter'].map((k) => (
                 <button
                   key={k}
                   className={`mini fchip ${filter === k ? 'on' : ''}`}

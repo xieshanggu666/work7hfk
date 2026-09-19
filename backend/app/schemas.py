@@ -6,6 +6,11 @@ class CreateRunRequest(BaseModel):
     seed: Optional[int] = None
 
 
+class CreateExpeditionRequest(BaseModel):
+    seed: Optional[int] = None
+    chapters: Optional[int] = None  # 远征章节数（缺省 3，范围由服务端校验）
+
+
 class ActRequest(BaseModel):
     action: str
     node: Optional[str] = None

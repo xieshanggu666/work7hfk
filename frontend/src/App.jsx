@@ -7,11 +7,13 @@ import RewardView from './components/RewardView.jsx'
 import ForgeView from './components/ForgeView.jsx'
 import ShopView from './components/ShopView.jsx'
 import DeckView from './components/DeckView.jsx'
+import ChapterClearView from './components/ChapterClearView.jsx'
 import ReplayPlayer from './components/ReplayPlayer.jsx'
 
 export default function App() {
   const { view, setCards, cards, runId, setRunId, applyRun } = useStore()
   const [seed, setSeed] = useState('')
+  const [chapters, setChapters] = useState('3')
   const [resumeId, setResumeId] = useState('')
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState('')
@@ -33,6 +35,22 @@ export default function App() {
     setLoading(true); setErr('')
     try {
       const run = await api.createRun(seed ? Number(seed) : undefined)
+      applyRun(run)
+      setRunId(run.run_id)
+    } catch (e) {
+      setErr(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function createExpedition() {
+    setLoading(true); setErr('')
+    try {
+      const run = await api.createExpedition(
+        seed ? Number(seed) : undefined,
+        chapters ? Number(chapters) : undefined,
+      )
       applyRun(run)
       setRunId(run.run_id)
     } catch (e) {
@@ -95,6 +113,15 @@ export default function App() {
           </button>
           <div className="divider" />
           <div className="fieldrow">
+            <span>远征章节（2-9）</span>
+            <input value={chapters} onChange={(e) => setChapters(e.target.value)} placeholder="3" />
+            <button className="primary" onClick={createExpedition} disabled={loading}>
+              🚩 创建多章远征
+            </button>
+          </div>
+          <p className="sub hintline">远征：击败章节首领后携带牌组、锻造成长与遗物进入下一章；战败结算远征并按已通关章节解锁新卡。</p>
+          <div className="divider" />
+          <div className="fieldrow">
             <span>续局 ID</span>
             <input value={resumeId} onChange={(e) => setResumeId(e.target.value)} placeholder="粘贴 run_id" />
             <button onClick={resume} disabled={loading}>续局</button>
@@ -127,6 +154,9 @@ export default function App() {
     <div className="screen">
       <header className="topbar">
         <span className="brand">卡牌闯关</span>
+        {view.expedition && (
+          <span className="chip exp">🚩 第 {view.expedition.chapter}/{view.expedition.total_chapters} 章</span>
+        )}
         <span>生命 {view.health}/{view.max_health}</span>
         <span>金币 {view.gold}</span>
         <span>牌组 {view.deck.length}</span>
@@ -142,7 +172,21 @@ export default function App() {
         <div className="overlay">
           <div className="endcard">
             <h2>{view.status === 'won' ? '🎉 通关！' : '💀 失败'}</h2>
-            <p>{view.status === 'lost' && '失败解锁了一张新卡。'}</p>
+            {view.expedition && (
+              <div className="exphistory">
+                <h3>远征历程（{view.expedition.history.filter((h) => h.result === 'cleared').length}/{view.expedition.total_chapters} 章）</h3>
+                <div className="expchips">
+                  {view.expedition.history.map((h, i) => (
+                    <span key={i} className={`chip ${h.result}`}>
+                      第{h.chapter}章 {h.result === 'cleared' ? '✅ 通关' : '💀 战败'}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+            <p>{view.status === 'lost' && (view.expedition
+              ? '远征已结算：按已通关章节数解锁了新卡。'
+              : '失败解锁了一张新卡。')}</p>
             <DeckView />
             <div className="fieldrow"><button className="primary" onClick={newRun}>再来一局</button></div>
           </div>
@@ -168,6 +212,7 @@ export default function App() {
           {hasReward && !ended && <RewardView view={view} />}
           {hasForge && !ended && <ForgeView view={view} />}
           {showShop && !ended && <ShopView view={view} onClose={() => setShopDismissed(true)} />}
+          {view.expedition?.pending_next && !ended && <ChapterClearView view={view} />}
         </div>
       </div>
 

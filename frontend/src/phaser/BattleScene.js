@@ -290,6 +290,9 @@ export default class BattleScene extends Phaser.Scene {
       if (entry.result === 'won' || entry.result === 'run_won') {
         await this.die(this.entities.enemy)
         await this.banner(entry.result === 'run_won' ? '🏆 通关！' : '胜利！', '#ffd166', 650)
+      } else if (entry.result === 'chapter_clear') {
+        await this.die(this.entities.enemy)
+        await this.banner(`🚩 第 ${entry.chapter} 章通关！`, '#ffd166', 650)
       } else if (entry.result === 'lost') {
         await this.die(this.entities.player)
         await this.banner('战败…', '#ff6b6b', 650)

@@ -4,6 +4,10 @@
 
 ## 功能
 - 选择路线（种子地图，3 条节点路径，最终挑战首领）
+- **多章远征**：创建 2–9 章的跨章节远征，击败章节首领后携带牌组、锻造成长、遗物与金币
+  进入下一章（开章交接通关金币 + 营地休整，章节地图按种子确定性派生）；战败即结算远征，
+  按已通关章节数更新解锁；章节存档/奖励交接/整程回放统一管理，`pending_next`/`settled`
+  幂等键防止重复开章与重复结算
 - **卡牌锻造**：路线上的锻造节点花金币为指定卡牌选择强化分支（锋锐/强效/精炼）；同名卡为独立实例、各自保存成长状态
 - **旅途商店**：路线上的商人节点可购买卡牌/遗物，或付费移除指定卡牌实例；库存由种子确定性生成，
   统一事务处理扣款/售罄（409）/失败整体回退（400 零副作用），交易结果带入后续战斗，续局与回放一致
@@ -57,12 +61,16 @@ py -m pytest -q tests
 锻造同名卡独立成长、锻造贯通战斗/奖励/续局/回放、旧档迁移、
 商店库存确定性/续局一致、购买卡牌/遗物（扣款/售罄/失败回退）、移除指定实例（递增价/牌组下限）、
 交易贯通后续战斗与回放、**并发与原子提交（写入失败整体回滚、并发领奖/锻造/战败只生效一次、
-request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema 自动迁移、损坏日志/序号缺口容错）**。
+request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema 自动迁移、损坏日志/序号缺口容错）**、
+**多章远征（创建校验/章节交接携带锻造与遗物/通关金币与休整/防重复开章 409 与 request_id 幂等、
+终章通关只结算一次、战败按已通关章节解锁、整程回放跨章校验点一致且只读隔离不重复结算）**。
 
 ## API 摘要
 - `POST /api/runs {seed?}` 建局
+- `POST /api/expeditions {seed?, chapters?}` 创建多章远征（2–9 章，缺省 3）；
+  返回视口与普通 run 同构，`run_id` 可直接用于续局/行动/整程回放
 - `GET  /api/runs/{id}/resume` 续局
-- `POST /api/runs/{id}/act {action,...}` 行动（choose_node / play / end_turn / claim_reward / forge / shop_buy / shop_remove）
+- `POST /api/runs/{id}/act {action,...}` 行动（choose_node / play / end_turn / claim_reward / forge / shop_buy / shop_remove / next_chapter）
   - 可选并发字段：`request_id`（客户端为每个意图生成的令牌；同令牌重复/并发提交返回首次响应，
     响应里 `duplicate:true`，绝不重复执行）、`expected_rev`（所依据视口的存档版本号；
     存档已被推进则返回 409 状态冲突）。行动响应与 `/resume` 视口携带当前 `rev`。
@@ -75,6 +83,17 @@ request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema �
 锻造行动：`{action:"forge", card:<卡牌实例 uid>, branch:"sharpen"|"empower"|"refine"}`，
 花费 25 金币（`forge_cost` 随视口返回）；同一锻造节点仅可锻造一次，重复请求返回 409 且不扣款，
 金币不足/非法卡牌或分支返回 400（校验先于扣款，无副作用）。
+
+远征行动（视口携带 `expedition:{chapter,total_chapters,pending_next,settled,history}`）：
+- 击败非终章首领：run 不结束，`expedition.pending_next=true`，战斗事件带
+  `{"result":"chapter_clear"}`；此时不能在旧地图上继续走点（400）。
+- 开章：`{action:"next_chapter"}`，奖励交接（通关金币 30+15×章号、营地休整回复 40% 生命）
+  后携带牌组/锻造成长/遗物/金币进入下一章，章节地图按 `(种子, 章节)` 确定性派生；
+  无待开章时重复请求返回 409（防重复开章），`request_id` 重试返回首次响应。
+- 击败终章首领：`status=won`、整程结算（`settled=true`）；任一章节战败：`status=lost`、
+  整程结算并按已通关章节数解锁新卡（至少 1 张）。结算与存档/日志同一事务提交，只生效一次。
+- 整程回放复用 `GET /api/runs/{id}/replay`：远征全程一条动作日志，开章为 `chapter` 类型帧，
+  每帧按所处章节派生地图重建，校验点逐位一致。
 
 商店行动（进入商店节点后视口携带 `shop_available:true` 与 `shop` 库存）：
 - 购买：`{action:"shop_buy", kind:"card"|"relic", sku:<货架项 id，如 "card:cleave">}`，
@@ -115,3 +134,8 @@ request_id 幂等含并发同键、expected_rev 状态冲突 409、旧 schema �
   与 `verification.seq_gaps`。
 - SQLite：`runs`（状态，含 rev 乐观版本、商店库存/交易记录）、`battle_events`（动作日志，
   含 forge/shop 行）、`profile`（解锁卡）、`act_requests`（request_id → 首次响应，请求级幂等）。
+- 多章远征：一个 run 承载全部章节（`run.expedition` 统一保存章节进度/待开章/结算标记/逐章
+  结算记录），不新增表；章节地图按 `(seed, chapter)` 经 `_chapter_map_seed` 确定性派生，
+  在线行动/续局/回放共用 `_run_map` 取当前章地图。开章（`next_chapter`）只是动作日志里的
+  一个动作，因此整程回放、校验点、request_id 幂等与原子提交全部复用既有机制；
+  `pending_next` 拦截重复开章（409），`settled` 保证通关/战败结算只生效一次。
